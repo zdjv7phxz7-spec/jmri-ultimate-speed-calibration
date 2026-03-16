@@ -29,9 +29,10 @@ from java.awt.print import PrinterJob, Printable
 from javax.swing import (
     JFrame, JPanel, JLabel, JButton, JTextField, JComboBox, JTable, JScrollPane,
     JOptionPane, JSpinner, SpinnerNumberModel, BoxLayout, BorderFactory,
-    SwingUtilities, Timer, JTabbedPane
+    SwingUtilities, Timer, JTabbedPane, JSlider, JTextArea
 )
 from javax.swing.table import AbstractTableModel
+from javax.swing.event import ChangeListener
 
 # -------------------------------
 # Authoritative track geometry
@@ -475,17 +476,21 @@ class SpeedChartPanel(JPanel, MouseWheelListener):
         self.zoom = 1.0
         self.pad_left = 55
         self.pad_right = 20
-        self.pad_top = 20
+        self.pad_top = 48
         self.pad_bottom = 45
         self.base_w = 980
         self.base_h = 420
-        self.addMouseWheelListener(self)
+        self.meta_lines = []
 
     def setData(self, target, fwd, rev):
         self.target = list(target) if target else []
         self.fwd = list(fwd) if fwd else []
         self.rev = list(rev) if rev else []
         self.revalidate()
+        self.repaint()
+
+    def setMetaLines(self, lines):
+        self.meta_lines = list(lines) if lines else []
         self.repaint()
 
     def setZoom(self, z):
@@ -501,11 +506,7 @@ class SpeedChartPanel(JPanel, MouseWheelListener):
         return Dimension(int(self.base_w * self.zoom), int(self.base_h * self.zoom))
 
     def mouseWheelMoved(self, e):
-        rot = e.getWheelRotation()
-        if rot < 0:
-            self.setZoom(self.zoom * 1.15)
-        else:
-            self.setZoom(self.zoom / 1.15)
+        return
 
     def paint(self, g):
         JPanel.paint(self, g)
@@ -616,6 +617,20 @@ class SpeedChartPanel(JPanel, MouseWheelListener):
         g.setColor(Color(255, 140, 0))
         g.drawString("Reverse", x0 + 140, y0 + 15)
 
+        if self.meta_lines:
+            box_w = min(max(320, x1 - x0 - 24), 760)
+            box_h = 18 * len(self.meta_lines) + 12
+            box_x = max(x0 + 10, x1 - box_w - 10)
+            box_y = y0 + 26
+            g.setColor(Color(255, 255, 210))
+            g.fillRect(box_x, box_y, box_w, box_h)
+            g.setColor(Color.BLACK)
+            g.drawRect(box_x, box_y, box_w, box_h)
+            yy = box_y + 18
+            for line in self.meta_lines:
+                g.drawString(str(line)[:140], box_x + 8, yy)
+                yy += 18
+
 # -------------------------------
 # Decoder speed table bar chart panel (steps 1..28)
 # current vs calculated bars; CURRENT value on TOP of current bar
@@ -628,16 +643,20 @@ class DecoderTableBarChartPanel(JPanel, MouseWheelListener):
         self.zoom = 1.0
         self.pad_left = 60
         self.pad_right = 20
-        self.pad_top = 20
+        self.pad_top = 48
         self.pad_bottom = 55
         self.base_w = 980
         self.base_h = 420
-        self.addMouseWheelListener(self)
+        self.meta_lines = []
 
     def setData(self, calc_values, curr_values):
         self.calc_values = list(calc_values) if calc_values else []
         self.curr_values = list(curr_values) if curr_values else []
         self.revalidate()
+        self.repaint()
+
+    def setMetaLines(self, lines):
+        self.meta_lines = list(lines) if lines else []
         self.repaint()
 
     def setZoom(self, z):
@@ -653,11 +672,7 @@ class DecoderTableBarChartPanel(JPanel, MouseWheelListener):
         return Dimension(int(self.base_w * self.zoom), int(self.base_h * self.zoom))
 
     def mouseWheelMoved(self, e):
-        rot = e.getWheelRotation()
-        if rot < 0:
-            self.setZoom(self.zoom * 1.15)
-        else:
-            self.setZoom(self.zoom / 1.15)
+        return
 
     def paint(self, g):
         JPanel.paint(self, g)
@@ -754,6 +769,20 @@ class DecoderTableBarChartPanel(JPanel, MouseWheelListener):
         g.drawString("Current", x0 + 10, y0 + 15)
         g.setColor(col_calc)
         g.drawString("Calculated", x0 + 80, y0 + 15)
+
+        if self.meta_lines:
+            box_w = min(max(320, x1 - x0 - 24), 760)
+            box_h = 18 * len(self.meta_lines) + 12
+            box_x = max(x0 + 10, x1 - box_w - 10)
+            box_y = y0 + 26
+            g.setColor(Color(255, 255, 210))
+            g.fillRect(box_x, box_y, box_w, box_h)
+            g.setColor(Color.BLACK)
+            g.drawRect(box_x, box_y, box_w, box_h)
+            yy = box_y + 18
+            for line in self.meta_lines:
+                g.drawString(str(line)[:140], box_x + 8, yy)
+                yy += 18
 
 # -------------------------------
 # Printing support for charts
@@ -911,10 +940,6 @@ class SpeedState(object):
                 f.close()
         except:
             pass
-        try:
-            self.db_log_sample(step, mode, mph_val)
-        except:
-            pass
         # Samples file
         try:
             if not os.path.isfile(self.history_samples_csv):
@@ -965,8 +990,13 @@ class SpeedState(object):
                 conn.commit()
             finally:
                 conn.close()
-        except:
+        except Exception, e:
             self.db_run_id = None
+            try:
+                if self.dashboard is not None:
+                    self.dashboard.set_automation_status("DB begin run failed: %s" % str(e))
+            except:
+                pass
 
     def db_log_sample(self, step, mode, mph_val):
         if self.db_run_id is None:
@@ -1766,9 +1796,6 @@ class ResultsWindow(object):
         self.png_path_field.setEditable(False)
 
         self.btn_export = JButton("Export CSV+PNG")
-        self.btn_zoom_in = JButton("Zoom +")
-        self.btn_zoom_out = JButton("Zoom -")
-        self.btn_zoom_reset = JButton("Reset Zoom")
         self.btn_print_mph = JButton("Print MPH Chart")
         self.btn_print_cv = JButton("Print CV Chart")
 
@@ -1784,8 +1811,7 @@ class ResultsWindow(object):
             try:
                 run_id = getattr(self.state, "db_run_id", None)
                 if run_id is None:
-                    loco_id = getattr(self.state, "loco_id", None) or getattr(self.state, "roster_file", None)
-                    run_id = db_datamart.get_latest_run_id_for_loco(conn, loco_id)
+                    run_id = db_datamart.get_latest_run_id_for_loco(conn, self.state._db_loco_identity())
                 rows_written = db_datamart.log_results_rows(conn, run_id, self.results_rows)
                 conn.commit()
             finally:
@@ -1798,10 +1824,10 @@ class ResultsWindow(object):
                     self.state.dashboard.set_automation_status("Results saved to DB (run_id=%s, rows=%s)" % (str(run_id), str(rows_written)))
             except:
                 pass
-        except Exception:
+        except Exception, e:
             try:
-                import traceback
-                traceback.print_exc()
+                if hasattr(self.state, "dashboard") and self.state.dashboard is not None:
+                    self.state.dashboard.set_automation_status("Results DB save failed: %s" % str(e))
             except:
                 pass
 
@@ -1813,15 +1839,15 @@ class ResultsWindow(object):
 
         self.chart_mph = SpeedChartPanel()
         self.chart_mph.setData(self.target_arr, self.fwd_arr, self.rev_arr)
+        self.chart_mph.setMetaLines(["Engine: %s" % self.engine_label, self.decoder_label, "Generated: %s" % self.ts])
 
         self.chart_cv = DecoderTableBarChartPanel()
         self.chart_cv.setData(self.fwd_cv_arr, self.cur_cv_arr)
+        self.chart_cv.setMetaLines(["Engine: %s" % self.engine_label, self.decoder_label, "Generated: %s" % self.ts])
 
         self._build_ui()
         self._wire_actions()
 
-        self.chart_mph.setZoom(0.75)
-        self.chart_cv.setZoom(0.75)
 
         rw = self
         class W(WindowAdapter):
@@ -2025,9 +2051,6 @@ class ResultsWindow(object):
 
         btnp = JPanel()
         btnp.setLayout(BoxLayout(btnp, BoxLayout.X_AXIS))
-        btnp.add(self.btn_zoom_in)
-        btnp.add(self.btn_zoom_out)
-        btnp.add(self.btn_zoom_reset)
         btnp.add(self.btn_print_mph)
         btnp.add(self.btn_print_cv)
         btnp.add(self.btn_export)
@@ -2085,18 +2108,6 @@ class ResultsWindow(object):
                 self.fn = fn
             def actionPerformed(self, e):
                 self.fn()
-
-        def zoom_in():
-            rw.chart_mph.setZoom(rw.chart_mph.zoom * 1.25)
-            rw.chart_cv.setZoom(rw.chart_cv.zoom * 1.25)
-
-        def zoom_out():
-            rw.chart_mph.setZoom(rw.chart_mph.zoom / 1.25)
-            rw.chart_cv.setZoom(rw.chart_cv.zoom / 1.25)
-
-        def zoom_reset():
-            rw.chart_mph.setZoom(0.75)
-            rw.chart_cv.setZoom(0.75)
 
         def do_print_mph():
             print_component(rw.frame, "MPH Chart", rw.chart_mph)
@@ -2189,9 +2200,6 @@ class ResultsWindow(object):
             rw.csv_path_field.setText(csv_path)
             rw.png_path_field.setText(png_path)
 
-        self.btn_zoom_in.addActionListener(AL(zoom_in))
-        self.btn_zoom_out.addActionListener(AL(zoom_out))
-        self.btn_zoom_reset.addActionListener(AL(zoom_reset))
         self.btn_print_mph.addActionListener(AL(do_print_mph))
         self.btn_print_cv.addActionListener(AL(do_print_cv))
         self.btn_export.addActionListener(AL(export))
@@ -2231,8 +2239,14 @@ class Dashboard(object):
 
         self.btn_acquire = JButton("Acquire")
 
-        self.step_spinner = JSpinner(SpinnerNumberModel(0, 0, 28, 1))
-        self.btn_set_step = JButton("Set Step")
+        self.step_value_field = JTextField("0", 4)
+        self.step_value_field.setEditable(False)
+        self.step_slider = JSlider(0, 28, 0)
+        self.step_slider.setMajorTickSpacing(4)
+        self.step_slider.setMinorTickSpacing(1)
+        self.step_slider.setPaintTicks(True)
+        self.step_slider.setPaintLabels(True)
+        self._step_slider_internal = False
         self.btn_fwd = JButton("Forward")
         self.btn_rev = JButton("Reverse")
         self.btn_stop = JButton("STOP")
@@ -2250,8 +2264,10 @@ class Dashboard(object):
         self.btn_cancel_warmup = JButton("Cancel Warmup")
         self.btn_history = JButton("History")
         self.btn_cars = JButton("Cars")
-        self.auto_status_field = JTextField(90)
-        self.auto_status_field.setEditable(False)
+        self.auto_status_area = JTextArea(3, 90)
+        self.auto_status_area.setEditable(False)
+        self.auto_status_area.setLineWrap(True)
+        self.auto_status_area.setWrapStyleWord(True)
 
         self.target_min_field = JTextField("5", 6)
         self.target_max_field = JTextField("70", 6)
@@ -2392,11 +2408,9 @@ class Dashboard(object):
 
         r += 1
         g1.gridx = 0; g1.gridy = r; g1.weightx = 0.0
-        sec1.add(JLabel("Speed step:"), g1)
+        sec1.add(JLabel("Current speed step:"), g1)
         g1.gridx = 1; g1.gridy = r; g1.weightx = 0.0
-        sec1.add(self.step_spinner, g1)
-        g1.gridx = 2; g1.gridy = r; g1.weightx = 0.0
-        sec1.add(self.btn_set_step, g1)
+        sec1.add(self.step_value_field, g1)
 
         man_panel = JPanel()
         man_panel.setLayout(BoxLayout(man_panel, BoxLayout.X_AXIS))
@@ -2404,9 +2418,11 @@ class Dashboard(object):
         man_panel.add(self.btn_rev)
         man_panel.add(self.btn_stop)
 
+        g1.gridx = 2; g1.gridy = r; g1.weightx = 0.0
+        sec1.add(man_panel, g1)
         g1.gridx = 3; g1.gridy = r; g1.weightx = 1.0
         g1.gridwidth = 3
-        sec1.add(man_panel, g1)
+        sec1.add(self.step_slider, g1)
         g1.gridwidth = 1
 
         sec2 = JPanel()
@@ -2432,12 +2448,14 @@ class Dashboard(object):
         sec2.add(self.warmup_minutes_combo, g2)
         g2.gridx = 7; g2.gridy = 0; g2.weightx = 0.0
         sec2.add(self.btn_cancel_warmup, g2)
-        g2.gridx = 7; g2.gridy = 0; g2.weightx = 0.0
-        sec2.add(self.btn_history, g2)
         g2.gridx = 8; g2.gridy = 0; g2.weightx = 0.0
+        sec2.add(self.btn_history, g2)
+        g2.gridx = 9; g2.gridy = 0; g2.weightx = 0.0
         sec2.add(self.btn_cars, g2)
-        g2.gridx = 9; g2.gridy = 0; g2.weightx = 1.0
-        sec2.add(self.auto_status_field, g2)
+        g2.gridx = 0; g2.gridy = 1; g2.weightx = 1.0
+        g2.gridwidth = 11
+        sec2.add(JScrollPane(self.auto_status_area), g2)
+        g2.gridwidth = 1
 
         sec3 = JPanel()
         sec3.setLayout(GridBagLayout())
@@ -2454,8 +2472,10 @@ class Dashboard(object):
         sec3.add(JLabel("Target Max mph:"), g3)
         g3.gridx = 3; g3.gridy = 0; g3.weightx = 0.0
         sec3.add(self.target_max_field, g3)
-        g3.gridx = 4; g3.gridy = 0; g3.weightx = 0.0
+        g3.gridx = 0; g3.gridy = 1; g3.weightx = 1.0
+        g3.gridwidth = 5
         sec3.add(self.btn_calc, g3)
+        g3.gridwidth = 1
 
         summary = JPanel()
 
@@ -2573,11 +2593,6 @@ class Dashboard(object):
                 JOptionPane.showMessageDialog(dash.frame, msg, "Load CV's", JOptionPane.WARNING_MESSAGE)
                 dash.set_throttle_status("Using synthetic baseline (loco XML not found).")
 
-        def do_set_step():
-            step = int(dash.step_spinner.getValue())
-            st._apply_step(step)
-            dash.update_summary_fields()
-
         def do_forward():
             st._set_dir_forward(True)
             dash.update_summary_fields()
@@ -2602,8 +2617,7 @@ class Dashboard(object):
                 mode = "FWD"
             elif sel.startswith("Reverse"):
                 mode = "REV"
-            import run_speed_matching_iterative
-            run_speed_matching_iterative.start_iterative_forward_calibration(st, dash)
+            st.start_automation(mode)
 
         def do_stop_auto():
             st.stop_automation_only("Stopped by user")
@@ -2623,7 +2637,12 @@ class Dashboard(object):
 
         def do_warmup():
             try:
-                _get_warm().start()
+                minutes = 5
+                try:
+                    minutes = int(str(dash.warmup_minutes_combo.getSelectedItem()))
+                except:
+                    minutes = 5
+                _get_warm().start(minutes)
             except Exception, e:
                 dash.set_automation_status("Warmup error: %s" % str(e))
 
@@ -2671,10 +2690,26 @@ class Dashboard(object):
             rw = ResultsWindow(st, tmin, tmax)
             st.results_window = rw
 
+        class StepCL(ChangeListener):
+            def stateChanged(self, e):
+                try:
+                    if dash._step_slider_internal:
+                        return
+                except:
+                    pass
+                try:
+                    step = int(dash.step_slider.getValue())
+                    dash.step_value_field.setText(str(step))
+                    st._apply_step(step)
+                    dash.update_summary_fields()
+                except:
+                    pass
+
+        self.step_slider.addChangeListener(StepCL())
+
         self.btn_acquire.addActionListener(SimpleAL(do_acquire))
         self.btn_use_addr.addActionListener(SimpleAL(do_get_by_addr))
         self.btn_load_cv.addActionListener(SimpleAL(do_load_cv))
-        self.btn_set_step.addActionListener(SimpleAL(do_set_step))
         self.btn_fwd.addActionListener(SimpleAL(do_forward))
         self.btn_rev.addActionListener(SimpleAL(do_reverse))
         self.btn_stop.addActionListener(SimpleAL(do_stop))
@@ -2715,9 +2750,20 @@ class Dashboard(object):
 
     def set_step_spinner_value(self, v):
         try:
-            self.step_spinner.setValue(int(v))
+            iv = int(v)
+        except:
+            iv = 0
+        iv = clamp_int(iv, 0, 28)
+        try:
+            self._step_slider_internal = True
+            self.step_slider.setValue(iv)
         except:
             pass
+        try:
+            self.step_value_field.setText(str(iv))
+        except:
+            pass
+        self._step_slider_internal = False
 
     def set_throttle_status(self, msg):
         try:
@@ -2727,7 +2773,7 @@ class Dashboard(object):
 
     def set_automation_status(self, msg):
         try:
-            self.auto_status_field.setText(str(msg))
+            self.auto_status_area.setText(str(msg))
         except:
             pass
 
@@ -2758,6 +2804,7 @@ class Dashboard(object):
             pass
         try:
             self.step_field.setText(str(st.current_step))
+            self.step_value_field.setText(str(st.current_step))
         except:
             pass
         try:
