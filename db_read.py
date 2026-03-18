@@ -84,3 +84,56 @@ def list_results_rows(run_id):
             ps.close()
     finally:
         conn.close()
+
+
+def get_run_header(run_id):
+    conn = db_datamart.connect()
+    try:
+        run_cols = _colnames(conn, 'speed_run')
+        loco_cols = _colnames(conn, 'loco')
+        mode_col = 'run_mode' if 'run_mode' in run_cols else ('mode' if 'mode' in run_cols else None)
+        min_expr = 'r.target_min_mph' if 'target_min_mph' in run_cols else 'NULL'
+        max_expr = 'r.target_max_mph' if 'target_max_mph' in run_cols else 'NULL'
+        notes_expr = 'r.notes' if 'notes' in run_cols else 'NULL'
+        disp_expr = 'l.display_name' if 'display_name' in loco_cols else 'NULL'
+        roster_expr = 'l.roster_file' if 'roster_file' in loco_cols else 'NULL'
+        dcc_expr = 'l.dcc_address' if 'dcc_address' in loco_cols else 'NULL'
+        sql = ('SELECT r.run_id, r.loco_id, r.run_ts, r.direction, ' +
+               ((('r.' + mode_col) if mode_col else "''") + ' AS mode') + ', ' +
+               min_expr + ' AS target_min_mph, ' +
+               max_expr + ' AS target_max_mph, ' +
+               notes_expr + ' AS notes, ' +
+               disp_expr + ' AS display_name, ' +
+               roster_expr + ' AS roster_file, ' +
+               dcc_expr + ' AS dcc_address ' +
+               'FROM speed_run r LEFT JOIN loco l ON r.loco_id = l.loco_id WHERE r.run_id=?')
+        ps = conn.prepareStatement(sql)
+        try:
+            ps.setLong(1, int(run_id))
+            rs = ps.executeQuery()
+            try:
+                if not rs.next():
+                    return None
+                return {
+                    'run_id': int(rs.getLong('run_id')),
+                    'loco_id': rs.getString('loco_id'),
+                    'run_ts': int(rs.getLong('run_ts')) if rs.getObject('run_ts') is not None else None,
+                    'direction': rs.getString('direction'),
+                    'mode': rs.getString('mode'),
+                    'target_min_mph': rs.getDouble('target_min_mph') if rs.getObject('target_min_mph') is not None else None,
+                    'target_max_mph': rs.getDouble('target_max_mph') if rs.getObject('target_max_mph') is not None else None,
+                    'notes': rs.getString('notes'),
+                    'display_name': rs.getString('display_name'),
+                    'roster_file': rs.getString('roster_file'),
+                    'dcc_address': rs.getString('dcc_address')
+                }
+            finally:
+                rs.close()
+        finally:
+            ps.close()
+    finally:
+        conn.close()
+
+
+def get_run_payload(run_id):
+    return {'header': get_run_header(run_id), 'rows': list_results_rows(run_id), 'summaries': list_summaries(run_id)}

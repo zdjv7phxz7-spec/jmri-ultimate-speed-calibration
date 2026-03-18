@@ -16,6 +16,7 @@ SCRIPT_DIR = r"C:\Users\rschneider\JMRI\jython\ultimate_speed_calibration"
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+import speed_match_math
 
 from java.awt import BorderLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color, BasicStroke
 from java.awt.event import ActionListener, WindowAdapter, MouseWheelListener
@@ -857,6 +858,7 @@ class SpeedState(object):
         self.forward_buf = []
         self.reverse_buf = []
         self.seq_hist = []
+        self.seg4_anchor = None
         self.last_sensor_idx = None
 
         self.lap_start_time = None
@@ -913,6 +915,12 @@ class SpeedState(object):
         self.target_min_mph = 5.0
         self.target_max_mph = 70.0
         self.db_run_id = None
+
+        self.auto_iter_enabled = False
+        self.auto_iter_count = 0
+        self.auto_iter_max = 4
+        self.auto_iter_tolerance_pct = 15.0
+        self.auto_last_recommended_table = None
 
     def _get_history_dir(self):
         try:
@@ -1128,6 +1136,7 @@ class SpeedState(object):
     def _clear_sequence_history(self):
         self.seq_hist = []
         self.last_sensor_idx = None
+        self.seg4_anchor = None
 
     def _clear_buffers_for_current_direction(self):
         if self.current_dir_forward:
@@ -1334,6 +1343,248 @@ class SpeedState(object):
         if first_step:
             self._automation_advance_step_locked()
 
+    def _compute_results_payload(self):
+        return speed_match_math.compute_results_payload(
+            self.target_min_mph,
+            self.target_max_mph,
+            self.auto_measured_fwd,
+            self.auto_measured_rev,
+            self.auto_step_stats_fwd,
+            self.auto_step_stats_rev,
+            self.baseline_table
+        )
+
+    def _forward_tolerance_check(self, rows, pct_limit):
+        measured_steps = {}
+        try:
+            for k in self.auto_measured_fwd.keys():
+                measured_steps[int(k)] = True
+        except:
+            pass
+        if not measured_steps:
+            return (False, 'No forward measurements available.')
+
+        offenders = []
+        for row in rows:
+            try:
+                step = int(row.get('step'))
+            except:
+                continue
+            if not measured_steps.get(step, False):
+                continue
+            pct_s = str(row.get('f_pct', '')).strip()
+            if not pct_s:
+                continue
+            try:
+                pct_v = abs(float(pct_s))
+            except:
+                continue
+            if pct_v > float(pct_limit):
+                offenders.append((pct_v, step, pct_s))
+        if offenders:
+            offenders.sort(reverse=True)
+            worst = offenders[0]
+            return (False, 'Worst forward deviation step %d = %s%%' % (int(worst[1]), str(worst[2])))
+        return (True, 'All measured forward steps within %.1f%%.' % float(pct_limit))
+
+    def _get_addressed_programmer(self):
+        try:
+            return addressedProgrammers.getAddressedProgrammer(bool(self.addr_is_long), int(self.addr))
+        except:
+            pass
+        try:
+            apm = jmri.InstanceManager.getDefault(jmri.AddressedProgrammerManager)
+            if apm is not None:
+                return apm.getAddressedProgrammer(bool(self.addr_is_long), int(self.addr))
+        except:
+            pass
+        return None
+
+    def _write_speed_table_pom(self, cv_table):
+        prog = self._get_addressed_programmer()
+        if prog is None:
+            raise Exception('No addressed programmer available for POM.')
+
+        class _Waiter(jmri.ProgListener):
+            def __init__(self):
+                self.done = threading.Event()
+                self.value = None
+                self.status = None
+                self.callback_seen = False
+            def programmingOpReply(self, value, status):
+                self.value = value
+                self.status = status
+                self.callback_seen = True
+                self.done.set()
+
+        for idx in range(28):
+            cv_num = 67 + idx
+            cv_val = int(cv_table[idx])
+            waiter = _Waiter()
+            try:
+                prog.writeCV(str(cv_num), cv_val, waiter)
+            except Exception, e:
+                raise Exception('POM start failed for CV%d=%d: %s' % (cv_num, cv_val, str(e)))
+
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status('Tune Loco iteration %d/%d: POM writing CV%d=%d...' % (int(self.auto_iter_count), int(self.auto_iter_max), cv_num, cv_val))
+
+            # Ops Mode writes in this setup should not depend on a completion callback.
+            # Only treat an immediate callback error as a failure.
+            waiter.done.wait(0.05)
+            if waiter.callback_seen:
+                st = 0 if waiter.status is None else int(waiter.status)
+                if st != 0:
+                    try:
+                        msg = prog.decodeErrorCode(st)
+                    except:
+                        msg = 'status=%s' % str(st)
+                    raise Exception('CV%d write failed: %s' % (cv_num, str(msg)))
+
+            try:
+                time.sleep(0.25)
+            except:
+                pass
+
+        self.auto_last_recommended_table = list(cv_table)
+        self.baseline_table = list(cv_table)
+
+    def _stall_recovery_table(self, stalled_step):
+        try:
+            s = int(stalled_step)
+        except:
+            s = 1
+        if s < 1:
+            s = 1
+        if s > 28:
+            s = 28
+        donor_idx = s
+        if donor_idx > 27:
+            donor_idx = 27
+        table = list(self.baseline_table)
+        donor_cv = int(table[donor_idx])
+        for i in range(0, s):
+            table[i] = donor_cv
+        return table
+
+    def _handle_fwd_pom_stall(self, reason_s):
+        self._capture_elapsed_to_last()
+        stalled_step = int(self.current_step)
+        try:
+            run_id, rows_written = self._persist_results_rows_to_db()
+        except:
+            run_id, rows_written = (None, 0)
+        if int(self.auto_iter_count) >= int(self.auto_iter_max):
+            self.automation_running = False
+            self.auto_phase = 'DONE'
+            self._apply_step(0)
+            self.automation_status = 'Tune Loco stalled at step %d and reached max iterations (%d). Results saved to DB (run_id=%s, rows=%s).' % (stalled_step, int(self.auto_iter_max), str(run_id), str(rows_written))
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status(self.automation_status)
+                self.dashboard.set_automation_buttons_enabled(True)
+            return
+        try:
+            rec_table = self._stall_recovery_table(stalled_step)
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status('Tune Loco stall detected at step %d. Writing stall-recovery CV67-94 by POM...' % stalled_step)
+            self._write_speed_table_pom(rec_table)
+            self.auto_iter_count = int(self.auto_iter_count) + 1
+            self._prepare_forward_iteration_restart()
+            return
+        except Exception, e:
+            self.automation_running = False
+            self.auto_phase = 'DONE'
+            self._apply_step(0)
+            self.automation_status = 'Tune Loco stalled at step %d, then POM write failed: %s Results saved to DB (run_id=%s, rows=%s).' % (stalled_step, str(e), str(run_id), str(rows_written))
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status(self.automation_status)
+                self.dashboard.set_automation_buttons_enabled(True)
+            return
+
+    def _prepare_forward_iteration_restart(self):
+        self.auto_measured_fwd = {}
+        self.auto_step_stats_fwd = {}
+        self._set_dir_forward(True)
+        self.auto_phase = 'FWD_WARMUP'
+        try:
+            self.db_begin_run('FWD', self.auto_run_mode)
+        except:
+            pass
+        self.auto_warmup_laps_remaining = 3
+        self.auto_current_step_index = 0
+        self.auto_skip_remaining = 2
+        self._apply_step(28)
+        self.last_sensor_activity_time = time.time()
+        if self.dashboard is not None:
+            self.dashboard.set_step_spinner_value(28)
+            self.dashboard.update_summary_fields()
+            self.dashboard.set_automation_status('Tune Loco iteration %d/%d: forward warmup restart at step 28...' % (int(self.auto_iter_count), int(self.auto_iter_max)))
+        self.automation_status = 'Tune Loco iteration %d/%d: forward warmup restart at step 28...' % (int(self.auto_iter_count), int(self.auto_iter_max))
+
+    def _handle_forward_iteration_complete(self):
+        payload = self._compute_results_payload()
+        rows = payload.get('rows', [])
+        rec_table = payload.get('f_tbl', None)
+        ok, detail = self._forward_tolerance_check(rows, self.auto_iter_tolerance_pct)
+        if ok:
+            self._capture_elapsed_to_last()
+            self.automation_running = False
+            self.auto_phase = 'DONE'
+            self._apply_step(0)
+            try:
+                if self.dashboard is not None:
+                    self.dashboard.set_step_spinner_value(0)
+            except:
+                pass
+            run_id, rows_written = self._persist_results_rows_to_db()
+            self.automation_status = 'Tune Loco complete after %d iteration(s). %s Results saved to DB (run_id=%s, rows=%s).' % (int(self.auto_iter_count), str(detail), str(run_id), str(rows_written))
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status(self.automation_status)
+                self.dashboard.set_automation_buttons_enabled(True)
+            return
+
+        if rec_table is None:
+            self._capture_elapsed_to_last()
+            self.automation_running = False
+            self.auto_phase = 'DONE'
+            self._apply_step(0)
+            run_id, rows_written = self._persist_results_rows_to_db()
+            self.automation_status = 'Tune Loco stopped: no recommended CV table available. Results saved to DB (run_id=%s, rows=%s).' % (str(run_id), str(rows_written))
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status(self.automation_status)
+                self.dashboard.set_automation_buttons_enabled(True)
+            return
+
+        if int(self.auto_iter_count) >= int(self.auto_iter_max):
+            self._capture_elapsed_to_last()
+            self.automation_running = False
+            self.auto_phase = 'DONE'
+            self._apply_step(0)
+            run_id, rows_written = self._persist_results_rows_to_db()
+            self.automation_status = 'Tune Loco reached max iterations (%d). %s Results saved to DB (run_id=%s, rows=%s).' % (int(self.auto_iter_max), str(detail), str(run_id), str(rows_written))
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status(self.automation_status)
+                self.dashboard.set_automation_buttons_enabled(True)
+            return
+
+        try:
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status('Tune Loco iteration %d/%d outside tolerance. %s Starting POM write...' % (int(self.auto_iter_count), int(self.auto_iter_max), str(detail)))
+            self._write_speed_table_pom(rec_table)
+        except Exception, e:
+            self._capture_elapsed_to_last()
+            self.automation_running = False
+            self.auto_phase = 'DONE'
+            self._apply_step(0)
+            self.automation_status = 'Tune Loco POM failed: %s' % str(e)
+            if self.dashboard is not None:
+                self.dashboard.set_automation_status(self.automation_status)
+                self.dashboard.set_automation_buttons_enabled(True)
+            return
+
+        self.auto_iter_count += 1
+        self._prepare_forward_iteration_restart()
+
     def _stage_reverse_warmup(self):
         self._set_dir_forward(False)
         if self.dashboard is not None:
@@ -1359,6 +1610,8 @@ class SpeedState(object):
             if self.dashboard is not None:
                 self.dashboard.set_automation_status(self.automation_status)
             self._stage_reverse_warmup()
+        elif self.auto_run_mode == "FWD_POM":
+            self._handle_forward_iteration_complete()
         else:
             self._capture_elapsed_to_last()
             self.automation_running = False
@@ -1369,7 +1622,8 @@ class SpeedState(object):
                     self.dashboard.set_step_spinner_value(0)
             except:
                 pass
-            self.automation_status = "Forward automation complete. Speed set to 0. Click Calculate (Open Results)."
+            run_id, rows_written = self._persist_results_rows_to_db()
+            self.automation_status = "Forward automation complete. Results saved to DB (run_id=%s, rows=%s)." % (str(run_id), str(rows_written))
             if self.dashboard is not None:
                 self.dashboard.set_automation_status(self.automation_status)
                 self.dashboard.set_automation_buttons_enabled(True)
@@ -1393,7 +1647,8 @@ class SpeedState(object):
                         self.dashboard.set_step_spinner_value(0)
                 except:
                     pass
-                self.automation_status = "Automation complete. Speed set to 0. Click Calculate (Open Results)."
+                run_id, rows_written = self._persist_results_rows_to_db()
+                self.automation_status = "Automation complete. Results saved to DB (run_id=%s, rows=%s)." % (str(run_id), str(rows_written))
                 if self.dashboard is not None:
                     self.dashboard.set_automation_status(self.automation_status)
                     self.dashboard.set_automation_buttons_enabled(True)
@@ -1444,6 +1699,9 @@ class SpeedState(object):
             self.auto_start_time = None
             self.auto_last_elapsed = 0.0
             self.last_sensor_activity_time = time.time()
+            self.auto_iter_enabled = False
+            self.auto_iter_count = 0
+            self.auto_last_recommended_table = None
         if self.dashboard is not None:
             self.dashboard.set_automation_status(self.automation_status)
             self.dashboard.set_automation_buttons_enabled(True)
@@ -1454,6 +1712,9 @@ class SpeedState(object):
         self.build_automation_plan()
 
         self.auto_run_mode = str(run_mode)
+        self.auto_iter_enabled = (self.auto_run_mode == "FWD_POM")
+        self.auto_iter_count = 1 if self.auto_iter_enabled else 0
+        self.auto_last_recommended_table = None
 
         self.automation_running = True
         self.auto_start_time = time.time()
@@ -1490,8 +1751,71 @@ class SpeedState(object):
                 self.dashboard.set_step_spinner_value(28)
                 self.dashboard.update_summary_fields()
                 self.dashboard.set_automation_buttons_enabled(False)
-                self.dashboard.set_automation_status("Forward warmup: 3 laps at step 28...")
-            self.automation_status = "Forward warmup: 3 laps at step 28..."
+                if self.auto_run_mode == "FWD_POM":
+                    self.dashboard.set_automation_status("Tune Loco iteration 1/%d: forward warmup at step 28..." % int(self.auto_iter_max))
+                else:
+                    self.dashboard.set_automation_status("Forward warmup: 3 laps at step 28...")
+            if self.auto_run_mode == "FWD_POM":
+                self.automation_status = "Tune Loco iteration 1/%d: forward warmup at step 28..." % int(self.auto_iter_max)
+            else:
+                self.automation_status = "Forward warmup: 3 laps at step 28..."
+
+
+    def _current_activity_timeout_sec(self):
+        try:
+            step = int(self.current_step)
+        except:
+            step = 0
+        mode = self.auto_mode_by_step.get(step, '')
+        if self.auto_run_mode == 'FWD_POM' and self.auto_phase == 'FWD_MEASURE':
+            return 40.0
+        if self.auto_phase in ['FWD_WARMUP', 'REV_WARMUP']:
+            return 75.0
+        if mode == 'SEG1':
+            if step <= 2:
+                return 150.0
+            if step <= 4:
+                return 120.0
+            return 90.0
+        if mode == 'SEG4':
+            return 90.0
+        if mode == 'LAP':
+            return 60.0
+        return 75.0
+
+    def _persist_results_rows_to_db(self):
+        try:
+            import db_datamart
+            payload = self._compute_results_payload()
+            rows = payload.get('rows', [])
+            if not rows:
+                return (None, 0)
+            conn = db_datamart.connect()
+            try:
+                run_id = getattr(self, 'db_run_id', None)
+                if run_id is None:
+                    run_id = db_datamart.get_latest_run_id_for_loco(conn, self._db_loco_identity())
+                if run_id is None:
+                    return (None, 0)
+                try:
+                    ps = conn.prepareStatement('DELETE FROM speed_run_results_row WHERE run_id=?')
+                    try:
+                        ps.setInt(1, int(run_id))
+                        ps.executeUpdate()
+                    finally:
+                        ps.close()
+                except:
+                    pass
+                rows_written = db_datamart.log_results_rows(conn, run_id, rows)
+                conn.commit()
+                return (run_id, rows_written)
+            finally:
+                try:
+                    conn.close()
+                except:
+                    pass
+        except:
+            return (None, 0)
 
     def stop_automation_only(self, reason):
         if not self.automation_running:
@@ -1511,9 +1835,17 @@ class SpeedState(object):
                 self.dashboard.set_automation_buttons_enabled(False)
             return
 
+        if ("No sensor activity" in reason_s) and self.auto_phase == 'FWD_MEASURE' and self.auto_run_mode == 'FWD_POM':
+            self._handle_fwd_pom_stall(reason_s)
+            return
+
         self._capture_elapsed_to_last()
         self.automation_running = False
-        self.automation_status = "Automation stopped: %s" % reason_s
+        try:
+            run_id, rows_written = self._persist_results_rows_to_db()
+        except:
+            run_id, rows_written = (None, 0)
+        self.automation_status = "Automation stopped: %s Results saved to DB (run_id=%s, rows=%s)" % (reason_s, str(run_id), str(rows_written))
         if self.dashboard is not None:
             self.dashboard.set_automation_status(self.automation_status)
             self.dashboard.set_automation_buttons_enabled(True)
@@ -1546,6 +1878,7 @@ class SpeedState(object):
             if self.last_sensor_idx is None:
                 self.last_sensor_idx = idx
                 self.seq_hist = [(idx, tnow)]
+                self.seg4_anchor = None
                 if idx == 1:
                     self.lap_start_time = tnow
                 return
@@ -1553,6 +1886,7 @@ class SpeedState(object):
             if not self.is_valid_transition(self.last_sensor_idx, idx, forward):
                 self.last_sensor_idx = idx
                 self.seq_hist = [(idx, tnow)]
+                self.seg4_anchor = None
                 if idx == 1:
                     self.lap_start_time = tnow
                 return
@@ -1596,13 +1930,16 @@ class SpeedState(object):
                         self.seq_hist = [(self.seq_hist[-2][0], self.seq_hist[-2][1]), (idx, tnow)]
 
             if step in [12, 8]:
-                if len(self.seq_hist) >= 5:
-                    (idx_4back, t_4back) = self.seq_hist[-5]
-                    if idx == self.expected_next(idx_4back, forward, 4):
-                        dt4 = tnow - t_4back
+                if self.seg4_anchor is None:
+                    self.seg4_anchor = (idx, tnow)
+                else:
+                    (idx_anchor, t_anchor) = self.seg4_anchor
+                    if idx == self.expected_next(idx_anchor, forward, 4):
+                        dt4 = tnow - t_anchor
                         mph4 = mph_from(4.0 * BLOCK_LENGTH_SCALE_FEET, dt4)
                         if mph4 is not None:
                             self._automation_consider_sample("SEG4", mph4)
+                        self.seg4_anchor = (idx, tnow)
 
             if idx == 1:
                 if self.lap_start_time is not None:
@@ -1804,6 +2141,8 @@ class ResultsWindow(object):
         self.ts = now_str()
 
         self.results_rows, self.target_arr, self.fwd_arr, self.rev_arr, self.fwd_cv_arr, self.cur_cv_arr = self._compute_results()
+        run_id = None
+        rows_written = 0
         # Persist derived results rows to SQLite (best-effort; never break UI)
         try:
             import db_datamart
@@ -1831,7 +2170,20 @@ class ResultsWindow(object):
             except:
                 pass
 
-
+        # Unified DB-backed results screen for both live runs and history recall.
+        if run_id is not None and int(rows_written) > 0:
+            try:
+                import results_db_view
+                self.db_results_window = results_db_view.open_results_for_run_id(run_id, None)
+                if self.db_results_window is not None:
+                    self.frame = self.db_results_window.frame
+                    return
+            except Exception, e:
+                try:
+                    if hasattr(self.state, "dashboard") and self.state.dashboard is not None:
+                        self.state.dashboard.set_automation_status("Results DB-backed open failed: %s" % str(e))
+                except:
+                    pass
 
         self.table_model = ResultsTableModel(self.results_rows)
         self.table = JTable(self.table_model)
@@ -1959,80 +2311,16 @@ class ResultsWindow(object):
             return None
 
     def _compute_results(self):
-        st = self.state
-        targets = self._compute_targets_28()
-
-        f_anchors = []
-        for step, mphv in st.auto_measured_fwd.items():
-            try:
-                s = int(step)
-                m = float(mphv)
-                if 1 <= s <= 28:
-                    f_anchors.append((s, m))
-            except:
-                pass
-
-        r_anchors = []
-        for step, mphv in st.auto_measured_rev.items():
-            try:
-                s = int(step)
-                m = float(mphv)
-                if 1 <= s <= 28:
-                    r_anchors.append((s, m))
-            except:
-                pass
-
-        f_est = self._interp_est_28(f_anchors)
-        r_est = self._interp_est_28(r_anchors)
-
-        current_cv = list(st.baseline_table) if st.baseline_table and len(st.baseline_table) == 28 else [int(round((i + 1) / 28.0 * 255.0)) for i in range(28)]
-        f_tbl = self._recommend_table_28_damped(current_cv, targets, f_est)
-
-        rows = []
-        for s in range(1, 29):
-            target = targets[s - 1]
-            fm = f_est[s - 1]
-            rm = r_est[s - 1]
-
-            f_err_val = None
-            if fm is not None:
-                f_err_val = float(fm) - float(target)
-
-            r_err_val = None
-            # reverse treated as trim vs forward (requested): RevError = Rev - Fwd
-            if (rm is not None) and (fm is not None):
-                r_err_val = float(rm) - float(fm)
-
-            f_pct = ""
-            if f_err_val is not None and float(target) != 0.0:
-                f_pct = "%.2f" % (100.0 * f_err_val / float(target))
-
-            r_pct = ""
-            if r_err_val is not None and (fm is not None) and float(fm) != 0.0:
-                r_pct = "%.2f" % (100.0 * r_err_val / float(fm))
-
-            f_moe = self._step_moe_for(st.auto_step_stats_fwd, s)
-            r_moe = self._step_moe_for(st.auto_step_stats_rev, s)
-
-            rows.append({
-                "step": s,
-                "target": "%.2f" % float(target),
-
-                "f_meas": "" if fm is None else "%.2f" % float(fm),
-                "f_err": "" if f_err_val is None else "%.2f" % float(f_err_val),
-                "f_pct": f_pct,
-                "f_moe": "" if f_moe is None else "%.2f" % float(f_moe),
-
-                "f_tbl": str(f_tbl[s - 1]),
-                "cur_tbl": str(current_cv[s - 1]),
-
-                "r_meas": "" if rm is None else "%.2f" % float(rm),
-                "r_err": "" if r_err_val is None else "%.2f" % float(r_err_val),
-                "r_pct": r_pct,
-                "r_moe": "" if r_moe is None else "%.2f" % float(r_moe)
-            })
-
-        return rows, targets, f_est, r_est, f_tbl, current_cv
+        payload = speed_match_math.compute_results_payload(
+            self.target_min,
+            self.target_max,
+            self.state.auto_measured_fwd,
+            self.state.auto_measured_rev,
+            self.state.auto_step_stats_fwd,
+            self.state.auto_step_stats_rev,
+            self.state.baseline_table
+        )
+        return payload.get('rows', []), payload.get('targets', []), payload.get('f_est', []), payload.get('r_est', []), payload.get('f_tbl', []), payload.get('cur_cv', [])
 
     def _build_ui(self):
         root = JPanel()
@@ -2251,7 +2539,7 @@ class Dashboard(object):
         self.btn_rev = JButton("Reverse")
         self.btn_stop = JButton("STOP")
 
-        self.auto_mode_combo = JComboBox(["Full (FWD->REV)", "Forward Only", "Reverse Only"])
+        self.auto_mode_combo = JComboBox(["Full (FWD-REV)", "Tune Loco (FWD-POM)", "Rev Trim (REV)"])
         self.btn_start_auto = JButton("Start")
         self.btn_stop_auto = JButton("Stop Automation")
         self.btn_reset_auto = JButton("Reset Auto Results")
@@ -2613,9 +2901,9 @@ class Dashboard(object):
             _sync_targets_to_state()
             sel = str(dash.auto_mode_combo.getSelectedItem())
             mode = "FULL"
-            if sel.startswith("Forward"):
-                mode = "FWD"
-            elif sel.startswith("Reverse"):
+            if sel.startswith("Tune Loco"):
+                mode = "FWD_POM"
+            elif sel.startswith("Rev Trim"):
                 mode = "REV"
             st.start_automation(mode)
 
@@ -2739,8 +3027,9 @@ class Dashboard(object):
             def actionPerformed(self, e):
                 if st.automation_running:
                     # prevent false timeout right at start by always refreshing activity timer on phase/step changes
-                    if (time.time() - st.last_sensor_activity_time) > NO_ACTIVITY_TIMEOUT_SEC:
-                        st.stop_automation_only("No sensor activity for %.0f seconds" % NO_ACTIVITY_TIMEOUT_SEC)
+                    timeout_sec = st._current_activity_timeout_sec()
+                    if (time.time() - st.last_sensor_activity_time) > timeout_sec:
+                        st.stop_automation_only("No sensor activity for %.0f seconds at step %s (%s)" % (timeout_sec, str(st.current_step), str(st.auto_mode_by_step.get(st.current_step, ''))))
 
         self.activity_timer = Timer(1000, ActAL())
         self.activity_timer.start()
