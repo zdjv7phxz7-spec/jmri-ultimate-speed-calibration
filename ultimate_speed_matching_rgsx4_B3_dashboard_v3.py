@@ -12,6 +12,8 @@ import datetime
 import threading
 import xml.etree.ElementTree as ET
 import sys
+from java.util.logging import Logger, Level
+LOGGER = Logger.getLogger('UltimateSpeedMatching')
 SCRIPT_DIR = r"C:\Users\rschneider\JMRI\jython\ultimate_speed_calibration"
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
@@ -48,16 +50,32 @@ CIRCLE_LENGTH_SCALE_FEET = 1596.0
 MAD_K = 3.5
 NO_ACTIVITY_TIMEOUT_SEC = 40.0
 LIVE_REFRESH_MS = 250
+MEASURE_SAMPLES_PER_STEP = 3  # test pacing
 
 # Recommended CV damping (reduces overshoot/undershoot vs pure ratio)
 CV_GAIN = 0.45
 CV_RATIO_MIN = 0.80
 CV_RATIO_MAX = 1.20
-CV_MAX_STEP_DELTA = 10
+CV_MAX_STEP_DELTA = 20
 
 # -------------------------------
 # Helpers
 # -------------------------------
+
+def log_console(msg, level='INFO'):
+    try:
+        if level == 'SEVERE':
+            LOGGER.severe(str(msg))
+        elif level == 'WARNING':
+            LOGGER.warning(str(msg))
+        else:
+            LOGGER.info(str(msg))
+    except:
+        try:
+            print(str(msg))
+        except:
+            pass
+
 def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -826,9 +844,9 @@ def print_component(parent_frame, title, comp):
         pj.setPrintable(P())
         if pj.printDialog():
             pj.print()
-    except Exception, e:
+    except:
         try:
-            JOptionPane.showMessageDialog(parent_frame, "Print failed: %s" % str(e), "Print", JOptionPane.ERROR_MESSAGE)
+            JOptionPane.showMessageDialog(parent_frame, "Print failed: %s" % str(sys.exc_info()[1]), "Print", JOptionPane.ERROR_MESSAGE)
         except:
             pass
 
@@ -918,7 +936,7 @@ class SpeedState(object):
 
         self.auto_iter_enabled = False
         self.auto_iter_count = 0
-        self.auto_iter_max = 4
+        self.auto_iter_max = 6
         self.auto_iter_tolerance_pct = 15.0
         self.auto_last_recommended_table = None
 
@@ -998,11 +1016,11 @@ class SpeedState(object):
                 conn.commit()
             finally:
                 conn.close()
-        except Exception, e:
+        except:
             self.db_run_id = None
             try:
                 if self.dashboard is not None:
-                    self.dashboard.set_automation_status("DB begin run failed: %s" % str(e))
+                    self.dashboard.set_automation_status("DB begin run failed: %s" % str(sys.exc_info()[1]))
             except:
                 pass
 
@@ -1293,12 +1311,12 @@ class SpeedState(object):
 
         info["mode"] = mode
         info["samples"].append(float(mph_val))
-        remaining = 7 - len(info["samples"])
-        self.automation_status = "%s step %d (%s): %d/7 (remaining %d)" % (self._automation_phase_label(), step, mode, len(info["samples"]), max(0, remaining))
+        remaining = MEASURE_SAMPLES_PER_STEP - len(info["samples"])
+        self.automation_status = "%s step %d (%s): %d/%d (remaining %d)" % (self._automation_phase_label(), step, mode, len(info["samples"]), MEASURE_SAMPLES_PER_STEP, max(0, remaining))
         if self.dashboard is not None:
             self.dashboard.set_automation_status(self.automation_status)
 
-        if len(info["samples"]) >= 7:
+        if len(info["samples"]) >= MEASURE_SAMPLES_PER_STEP:
             kept = mad_filter(info["samples"], MAD_K)
             m = mean(kept)
             if m is None:
@@ -1388,66 +1406,327 @@ class SpeedState(object):
         return (True, 'All measured forward steps within %.1f%%.' % float(pct_limit))
 
     def _get_addressed_programmer(self):
-        try:
-            return addressedProgrammers.getAddressedProgrammer(bool(self.addr_is_long), int(self.addr))
-        except:
-            pass
+        """
+        Best-effort lookup of an Ops Mode (Programming-on-the-Main) programmer for the selected address.
+
+        JMRI API signatures vary by version; we try multiple call shapes.
+        """
+        # Primary: AddressedProgrammerManager
         try:
             apm = jmri.InstanceManager.getDefault(jmri.AddressedProgrammerManager)
-            if apm is not None:
-                return apm.getAddressedProgrammer(bool(self.addr_is_long), int(self.addr))
         except:
-            pass
+            apm = None
+
+        addr = None
+        try:
+            addr = jmri.DccLocoAddress(int(self.addr), bool(self.addr_is_long))
+        except:
+            addr = None
+
+        if apm is not None:
+            # Newer: getAddressedProgrammer(DccLocoAddress, ProgListener)
+            try:
+                p = apm.getAddressedProgrammer(addr, None)
+                if p is not None:
+                    return p
+            except:
+                pass
+            # Older: getAddressedProgrammer(isLong, address)
+            try:
+                p = apm.getAddressedProgrammer(bool(self.addr_is_long), int(self.addr))
+                if p is not None:
+                    return p
+            except:
+                pass
+            # Some builds: getAddressedProgrammer(DccLocoAddress)
+            try:
+                p = apm.getAddressedProgrammer(addr)
+                if p is not None:
+                    return p
+            except:
+                pass
+
+        # Fallback: ProgrammerManager (some layouts expose addressed ops programmer here)
+        try:
+            pm = jmri.InstanceManager.getDefault(jmri.ProgrammerManager)
+        except:
+            pm = None
+        if pm is not None:
+            try:
+                p = pm.getAddressedProgrammer(addr)
+                if p is not None:
+                    return p
+            except:
+                pass
+            try:
+                p = pm.getAddressedProgrammer(bool(self.addr_is_long), int(self.addr))
+                if p is not None:
+                    return p
+            except:
+                pass
+
         return None
 
+
+    def _coerce_cv_table_pairs(self, cv_table):
+        """Accept either flat CV values [v67..v94] or pair tuples [(67,v67)..(94,v94)].
+        Always return sorted (cv, value) pairs for CV67..CV94.
+        """
+        if cv_table is None:
+            raise TypeError('CV table is None')
+        if not isinstance(cv_table, (list, tuple)):
+            raise TypeError('CV table must be list/tuple, got %s' % str(type(cv_table)))
+        if len(cv_table) == 0:
+            raise TypeError('CV table is empty')
+
+        first = cv_table[0]
+        out = []
+        if isinstance(first, (list, tuple)):
+            for row in cv_table:
+                if not isinstance(row, (list, tuple)) or len(row) != 2:
+                    raise TypeError('CV pair row invalid: %s' % str(row))
+                out.append((int(row[0]), int(row[1])))
+        else:
+            for i, val in enumerate(list(cv_table)):
+                out.append((67 + i, int(val)))
+
+        out.sort(key=lambda x: x[0])
+        return out
+
+    def _cv_pair_table_to_values(self, cv_table):
+        pairs = self._coerce_cv_table_pairs(cv_table)
+        vals = []
+        for cv_num, cv_val in pairs:
+            vals.append(int(cv_val))
+        return vals
+
+    def _build_pom_test_table(self):
+        """Return a deterministic CV67-94 table for POM testing.
+
+        This intentionally writes a visible ramp (5,10,15,...) capped at 255 so you can confirm
+        Ops Mode writes from the decoder programmer UI.
+        """
+        table = []
+        for i in range(28):
+            cv = 67 + i
+            val = 5 * (i + 1)
+            if val > 255:
+                val = 255
+            table.append((cv, val))
+        return table
+
     def _write_speed_table_pom(self, cv_table):
+        """Write CV67-94 (speed table) using Ops Mode (POM) in a serialized queue.
+
+        JMRI Programmer.writeCV() returns before the write is complete; callers must wait for
+        ProgListener.programmingOpReply(...) before starting the next write, otherwise Digitrax
+        LocoNet SlotManager will throw "programmer in use".  
+
+        This implementation mirrors JMRI's own speed table writer behavior (write-next-on-busy-clear),
+        but does it in a Jython-friendly queue with watchdog timeouts. 
+        """
         prog = self._get_addressed_programmer()
         if prog is None:
             raise Exception('No addressed programmer available for POM.')
 
-        class _Waiter(jmri.ProgListener):
-            def __init__(self):
-                self.done = threading.Event()
-                self.value = None
-                self.status = None
-                self.callback_seen = False
-            def programmingOpReply(self, value, status):
-                self.value = value
-                self.status = status
-                self.callback_seen = True
-                self.done.set()
+        try:
+            log_console('POM programmer=%s' % str(prog.__class__), 'INFO')
+            log_console('POM: attempting to set Ops mode', 'INFO')
+        except:
+            pass
 
-        for idx in range(28):
-            cv_num = 67 + idx
-            cv_val = int(cv_table[idx])
-            waiter = _Waiter()
+        # Put programmer in Ops (on-main) mode if the API supports it.
+        try:
+            if hasattr(prog, 'setMode'):
+                for mode_name in ['OPSBYTE', 'OPSByte', 'OPS', 'OPSBIT', 'OPSBit']:
+                    try:
+                        mode_obj = getattr(jmri.ProgMode, mode_name)
+                        prog.setMode(mode_obj)
+                        break
+                    except:
+                        pass
+        except:
+            pass
+
+        # Defensive copy + normalize to sorted CV order.
+        items = self._coerce_cv_table_pairs(cv_table)
+
+        from javax.swing import Timer
+
+        state = {
+            'idx': 0,
+            'requested': 0,
+            'callbacks': 0,
+            'timeouts': 0,
+            'errors': [],
+            't0': time.time(),
+            'done': False,
+            'watchdog': None,
+            'retry_timer': None,
+        }
+
+        def _is_busy_text(err_text):
+            t = (err_text or '').lower()
+            return ('programmer in use' in t) or ('already in use' in t) or ('busy' in t)
+
+        def _log_summary(level='INFO'):
             try:
-                prog.writeCV(str(cv_num), cv_val, waiter)
-            except Exception, e:
-                raise Exception('POM start failed for CV%d=%d: %s' % (cv_num, cv_val, str(e)))
+                elapsed = max(0.0, time.time() - state['t0'])
+            except:
+                elapsed = -1
+            try:
+                log_console(
+                    'POM summary: requested=%d/%d callbacks=%d timeouts=%d errors=%d elapsed_s=%.2f' % (
+                        state['requested'],
+                        len(items),
+                        state['callbacks'],
+                        state['timeouts'],
+                        len(state['errors']),
+                        elapsed,
+                    ),
+                    level,
+                )
+            except:
+                pass
+            if state['errors']:
+                cv_num, cv_val, msg = state['errors'][0]
+                try:
+                    log_console('POM first error: CV%d=%d %s' % (cv_num, cv_val, msg), 'ERROR')
+                except:
+                    pass
 
-            if self.dashboard is not None:
-                self.dashboard.set_automation_status('Tune Loco iteration %d/%d: POM writing CV%d=%d...' % (int(self.auto_iter_count), int(self.auto_iter_max), cv_num, cv_val))
+        class _Listener(jmri.ProgListener):
+            def programmingOpReply(self, value, status):
+                # Called on the GUI thread per JMRI contract. 
+                try:
+                    state['callbacks'] += 1
+                except:
+                    pass
 
-            # Ops Mode writes in this setup should not depend on a completion callback.
-            # Only treat an immediate callback error as a failure.
-            waiter.done.wait(0.05)
-            if waiter.callback_seen:
-                st = 0 if waiter.status is None else int(waiter.status)
+                try:
+                    if state['watchdog'] is not None:
+                        state['watchdog'].stop()
+                        state['watchdog'] = None
+                except:
+                    pass
+
+                st = 0
+                try:
+                    st = int(status)
+                except:
+                    st = 0
+
                 if st != 0:
                     try:
                         msg = prog.decodeErrorCode(st)
                     except:
                         msg = 'status=%s' % str(st)
-                    raise Exception('CV%d write failed: %s' % (cv_num, str(msg)))
+                    try:
+                        cv_num, cv_val = items[state['idx']]
+                        state['errors'].append((cv_num, cv_val, 'write failed: %s' % str(msg)))
+                    except:
+                        pass
+                    state['done'] = True
+                    _log_summary('ERROR')
+                    return
+
+                # Advance to next CV.
+                state['idx'] += 1
+                t = Timer(1, _start_next)
+                t.setRepeats(False)
+                t.start()
+
+        listener = _Listener()
+
+        def _on_watchdog_timeout():
+            # If no callback arrives, treat as "unknown" completion and try to proceed.
+            try:
+                cv_num, cv_val = items[state['idx']]
+            except:
+                return
+            try:
+                state['timeouts'] += 1
+                log_console('POM timeout (no callback): CV%d=%d (will proceed with retries)' % (cv_num, cv_val), 'INFO')
+            except:
+                pass
+            state['idx'] += 1
+            _start_next()
+
+        def _schedule_watchdog():
+            try:
+                if state['watchdog'] is not None:
+                    state['watchdog'].stop()
+            except:
+                pass
+            wd = Timer(7000, lambda e: _on_watchdog_timeout())
+            wd.setRepeats(False)
+            state['watchdog'] = wd
+            wd.start()
+
+        def _start_next(event=None):
+            if state['done']:
+                return
+            if state['idx'] >= len(items):
+                state['done'] = True
+                _log_summary('INFO')
+                try:
+                    self.auto_last_recommended_table = self._cv_pair_table_to_values(cv_table)
+                    self.baseline_table = self._cv_pair_table_to_values(cv_table)
+                except:
+                    pass
+                return
+
+            cv_num, cv_val = items[state['idx']]
 
             try:
-                time.sleep(0.25)
+                log_console('POM write requested: CV%d=%d' % (cv_num, cv_val), 'INFO')
             except:
                 pass
 
-        self.auto_last_recommended_table = list(cv_table)
-        self.baseline_table = list(cv_table)
+            # Attempt to start this CV write; if busy, schedule retry.
+            try:
+                # LnOpsModeProgrammer is picky about argument types; prefer String/String.
+                try:
+                    prog.writeCV(str(cv_num), str(cv_val), listener)
+                except:
+                    # Fallback signatures (varies by JMRI/Jython reflection)
+                    try:
+                        prog.writeCV(str(cv_num), int(cv_val), listener)
+                    except:
+                        prog.writeCV(int(cv_num), int(cv_val), listener)
+                state['requested'] += 1
+                _schedule_watchdog()
+                return
+            except:
+                err = sys.exc_info()[1]
+                if _is_busy_text(str(err)):
+                    try:
+                        log_console('POM busy, retrying: CV%d=%d (%s)' % (cv_num, cv_val, str(err)), 'INFO')
+                    except:
+                        pass
+                    # retry after backoff
+                    try:
+                        if state['retry_timer'] is not None:
+                            state['retry_timer'].stop()
+                    except:
+                        pass
+                    rt = Timer(900, _start_next)
+                    rt.setRepeats(False)
+                    state['retry_timer'] = rt
+                    rt.start()
+                    return
+
+                try:
+                    state['errors'].append((cv_num, cv_val, 'start failed: %s' % str(err)))
+                except:
+                    pass
+                state['done'] = True
+                _log_summary('ERROR')
+                return
+
+        # Kick off the first write immediately.
+        _start_next()
+
 
     def _stall_recovery_table(self, stalled_step):
         try:
@@ -1485,17 +1764,31 @@ class SpeedState(object):
             return
         try:
             rec_table = self._stall_recovery_table(stalled_step)
+            rec_table = self._coerce_cv_table_pairs(rec_table)
+            try:
+                log_console('Tune Loco stall-recovery CV table=%s' % str(rec_table), 'INFO')
+            except:
+                pass
             if self.dashboard is not None:
                 self.dashboard.set_automation_status('Tune Loco stall detected at step %d. Writing stall-recovery CV67-94 by POM...' % stalled_step)
+            # Ensure locomotive is stopped on main before Ops-Mode writes
+            try:
+                self._apply_step(0)
+            except:
+                pass
+            try:
+                time.sleep(0.50)
+            except:
+                pass
             self._write_speed_table_pom(rec_table)
             self.auto_iter_count = int(self.auto_iter_count) + 1
             self._prepare_forward_iteration_restart()
             return
-        except Exception, e:
+        except:
             self.automation_running = False
             self.auto_phase = 'DONE'
             self._apply_step(0)
-            self.automation_status = 'Tune Loco stalled at step %d, then POM write failed: %s Results saved to DB (run_id=%s, rows=%s).' % (stalled_step, str(e), str(run_id), str(rows_written))
+            self.automation_status = 'Tune Loco stalled at step %d, then POM write failed: %s Results saved to DB (run_id=%s, rows=%s).' % (stalled_step, str(sys.exc_info()[1]), str(run_id), str(rows_written))
             if self.dashboard is not None:
                 self.dashboard.set_automation_status(self.automation_status)
                 self.dashboard.set_automation_buttons_enabled(True)
@@ -1521,29 +1814,65 @@ class SpeedState(object):
             self.dashboard.set_automation_status('Tune Loco iteration %d/%d: forward warmup restart at step 28...' % (int(self.auto_iter_count), int(self.auto_iter_max)))
         self.automation_status = 'Tune Loco iteration %d/%d: forward warmup restart at step 28...' % (int(self.auto_iter_count), int(self.auto_iter_max))
 
+
+    def _final_tune_loco_pom_write(self, rec_vals, detail, final_label):
+        rows_written = 0
+        run_id = None
+        final_pom = False
+        final_pom_msg = ''
+        try:
+            self._apply_step(0)
+        except:
+            pass
+        try:
+            if rec_vals is not None:
+                rec_table = self._coerce_cv_table_pairs(rec_vals)
+                try:
+                    log_console('Tune Loco final CV table=%s' % str(rec_table), 'INFO')
+                except:
+                    pass
+                self._write_speed_table_pom(rec_table)
+                final_pom = True
+                final_pom_msg = ' Final POM wrote %d CVs.' % len(rec_table)
+        except:
+            final_pom = False
+            final_pom_msg = ' Final POM failed: %s.' % str(sys.exc_info()[1])
+            try:
+                log_console('Tune Loco final POM failed: %s' % str(sys.exc_info()[1]), 'ERROR')
+            except:
+                pass
+        try:
+            run_id, rows_written = self._persist_results_rows_to_db()
+        except:
+            run_id, rows_written = (None, 0)
+        self.automation_running = False
+        self.auto_phase = 'DONE'
+        try:
+            self._apply_step(0)
+        except:
+            pass
+        try:
+            if self.dashboard is not None:
+                self.dashboard.set_step_spinner_value(0)
+        except:
+            pass
+        return (run_id, rows_written, final_pom_msg)
+
     def _handle_forward_iteration_complete(self):
         payload = self._compute_results_payload()
         rows = payload.get('rows', [])
-        rec_table = payload.get('f_tbl', None)
+        rec_vals = payload.get('f_tbl', None)
         ok, detail = self._forward_tolerance_check(rows, self.auto_iter_tolerance_pct)
         if ok:
             self._capture_elapsed_to_last()
-            self.automation_running = False
-            self.auto_phase = 'DONE'
-            self._apply_step(0)
-            try:
-                if self.dashboard is not None:
-                    self.dashboard.set_step_spinner_value(0)
-            except:
-                pass
-            run_id, rows_written = self._persist_results_rows_to_db()
-            self.automation_status = 'Tune Loco complete after %d iteration(s). %s Results saved to DB (run_id=%s, rows=%s).' % (int(self.auto_iter_count), str(detail), str(run_id), str(rows_written))
+            run_id, rows_written, final_pom_msg = self._final_tune_loco_pom_write(rec_vals, detail, 'complete')
+            self.automation_status = 'Tune Loco complete after %d iteration(s). %s%s Results saved to DB (run_id=%s, rows=%s).' % (int(self.auto_iter_count), str(detail), str(final_pom_msg), str(run_id), str(rows_written))
             if self.dashboard is not None:
                 self.dashboard.set_automation_status(self.automation_status)
                 self.dashboard.set_automation_buttons_enabled(True)
             return
 
-        if rec_table is None:
+        if rec_vals is None:
             self._capture_elapsed_to_last()
             self.automation_running = False
             self.auto_phase = 'DONE'
@@ -1557,26 +1886,34 @@ class SpeedState(object):
 
         if int(self.auto_iter_count) >= int(self.auto_iter_max):
             self._capture_elapsed_to_last()
-            self.automation_running = False
-            self.auto_phase = 'DONE'
-            self._apply_step(0)
-            run_id, rows_written = self._persist_results_rows_to_db()
-            self.automation_status = 'Tune Loco reached max iterations (%d). %s Results saved to DB (run_id=%s, rows=%s).' % (int(self.auto_iter_max), str(detail), str(run_id), str(rows_written))
+            run_id, rows_written, final_pom_msg = self._final_tune_loco_pom_write(rec_vals, detail, 'max')
+            self.automation_status = 'Tune Loco reached max iterations (%d). %s%s Results saved to DB (run_id=%s, rows=%s).' % (int(self.auto_iter_max), str(detail), str(final_pom_msg), str(run_id), str(rows_written))
             if self.dashboard is not None:
                 self.dashboard.set_automation_status(self.automation_status)
                 self.dashboard.set_automation_buttons_enabled(True)
             return
 
         try:
+            rec_table = self._coerce_cv_table_pairs(rec_vals)
+
+            try:
+                log_console('Tune Loco recommended CV table=%s' % str(rec_table), 'INFO')
+            except:
+                pass
+
             if self.dashboard is not None:
                 self.dashboard.set_automation_status('Tune Loco iteration %d/%d outside tolerance. %s Starting POM write...' % (int(self.auto_iter_count), int(self.auto_iter_max), str(detail)))
             self._write_speed_table_pom(rec_table)
-        except Exception, e:
+        except:
             self._capture_elapsed_to_last()
             self.automation_running = False
             self.auto_phase = 'DONE'
             self._apply_step(0)
-            self.automation_status = 'Tune Loco POM failed: %s' % str(e)
+            self.automation_status = 'Tune Loco POM failed: %s' % str(sys.exc_info()[1])
+            try:
+                log_console('Tune Loco POM failed: %s' % str(sys.exc_info()[1]), 'ERROR')
+            except:
+                pass
             if self.dashboard is not None:
                 self.dashboard.set_automation_status(self.automation_status)
                 self.dashboard.set_automation_buttons_enabled(True)
@@ -2055,24 +2392,24 @@ class SpeedState(object):
         try:
             self.throttleManager.requestThrottle(int(self.addr), bool(self.addr_is_long), listener)
             requested = True
-        except Exception, e:
-            last_err = e
-
+        except:
+            err = sys.exc_info()[1]
+            last_err = err
         if not requested:
             try:
                 self.throttleManager.requestThrottle(int(self.addr), listener)
                 requested = True
-            except Exception, e:
-                last_err = e
-
+            except:
+                err = sys.exc_info()[1]
+                last_err = err
         if not requested:
             try:
                 dcc = jmri.DccLocoAddress(int(self.addr), bool(self.addr_is_long))
                 self.throttleManager.requestThrottle(dcc, listener)
                 requested = True
-            except Exception, e:
-                last_err = e
-
+            except:
+                err = sys.exc_info()[1]
+                last_err = err
         if not requested:
             if self.dashboard is not None:
                 self.dashboard.set_throttle_status("Throttle request error: %s" % str(last_err))
@@ -2163,10 +2500,10 @@ class ResultsWindow(object):
                     self.state.dashboard.set_automation_status("Results saved to DB (run_id=%s, rows=%s)" % (str(run_id), str(rows_written)))
             except:
                 pass
-        except Exception, e:
+        except:
             try:
                 if hasattr(self.state, "dashboard") and self.state.dashboard is not None:
-                    self.state.dashboard.set_automation_status("Results DB save failed: %s" % str(e))
+                    self.state.dashboard.set_automation_status("Results DB save failed: %s" % str(sys.exc_info()[1]))
             except:
                 pass
 
@@ -2178,10 +2515,10 @@ class ResultsWindow(object):
                 if self.db_results_window is not None:
                     self.frame = self.db_results_window.frame
                     return
-            except Exception, e:
+            except:
                 try:
                     if hasattr(self.state, "dashboard") and self.state.dashboard is not None:
-                        self.state.dashboard.set_automation_status("Results DB-backed open failed: %s" % str(e))
+                        self.state.dashboard.set_automation_status("Results DB-backed open failed: %s" % str(sys.exc_info()[1]))
                 except:
                     pass
 
@@ -2275,7 +2612,23 @@ class ResultsWindow(object):
             else:
                 # ratio-based correction with damping
                 ratio = target / float(meas)
-                damped = 1.0 + CV_GAIN * (ratio - 1.0)
+                # Adaptive gain based on forward percent deviation vs target.
+                # When within 15% we take smaller steps to reduce oscillation.
+                dev_abs = 1.0
+                try:
+                    if float(target) != 0.0:
+                        dev_abs = abs((float(meas) - float(target)) / float(target))
+                    else:
+                        dev_abs = 1.0
+                except:
+                    dev_abs = 1.0
+                scale = dev_abs / 0.15
+                if scale < 0.10:
+                    scale = 0.10
+                if scale > 1.0:
+                    scale = 1.0
+                eff_gain = CV_GAIN * scale
+                damped = 1.0 + eff_gain * (ratio - 1.0)
                 if damped < CV_RATIO_MIN:
                     damped = CV_RATIO_MIN
                 if damped > CV_RATIO_MAX:
@@ -2442,8 +2795,8 @@ class ResultsWindow(object):
                         str(r.get("r_moe", ""))
                     ))
                 f.close()
-            except Exception, e:
-                JOptionPane.showMessageDialog(rw.frame, "CSV export failed: %s" % str(e), "Export", JOptionPane.ERROR_MESSAGE)
+            except:
+                JOptionPane.showMessageDialog(rw.frame, "CSV export failed: %s" % str(sys.exc_info()[1]), "Export", JOptionPane.ERROR_MESSAGE)
                 return
 
             try:
@@ -2481,8 +2834,8 @@ class ResultsWindow(object):
 
                 g2.dispose()
                 ImageIO.write(img, "png", File(png_path))
-            except Exception, e:
-                JOptionPane.showMessageDialog(rw.frame, "PNG export failed: %s" % str(e), "Export", JOptionPane.ERROR_MESSAGE)
+            except:
+                JOptionPane.showMessageDialog(rw.frame, "PNG export failed: %s" % str(sys.exc_info()[1]), "Export", JOptionPane.ERROR_MESSAGE)
                 return
 
             rw.csv_path_field.setText(csv_path)
@@ -2552,6 +2905,7 @@ class Dashboard(object):
         self.btn_cancel_warmup = JButton("Cancel Warmup")
         self.btn_history = JButton("History")
         self.btn_cars = JButton("Cars")
+        self.btn_pom_test = JButton("POM Write Test (CV67-94)")
         self.auto_status_area = JTextArea(3, 90)
         self.auto_status_area.setEditable(False)
         self.auto_status_area.setLineWrap(True)
@@ -2740,8 +3094,10 @@ class Dashboard(object):
         sec2.add(self.btn_history, g2)
         g2.gridx = 9; g2.gridy = 0; g2.weightx = 0.0
         sec2.add(self.btn_cars, g2)
+        g2.gridx = 10; g2.gridy = 0; g2.weightx = 0.0
+        sec2.add(self.btn_pom_test, g2)
         g2.gridx = 0; g2.gridy = 1; g2.weightx = 1.0
-        g2.gridwidth = 11
+        g2.gridwidth = 12
         sec2.add(JScrollPane(self.auto_status_area), g2)
         g2.gridwidth = 1
 
@@ -2931,8 +3287,8 @@ class Dashboard(object):
                 except:
                     minutes = 5
                 _get_warm().start(minutes)
-            except Exception, e:
-                dash.set_automation_status("Warmup error: %s" % str(e))
+            except:
+                dash.set_automation_status("Warmup error: %s" % str(sys.exc_info()[1]))
 
         def do_cancel_warmup():
             try:
@@ -2945,22 +3301,37 @@ class Dashboard(object):
                 import db_datamart
                 db_datamart.init_schema()
                 dash.db_status_field.setText("DB ready")
-            except Exception, e:
-                dash.db_status_field.setText("DB init failed: %s" % str(e))
+            except:
+                dash.db_status_field.setText("DB init failed: %s" % str(sys.exc_info()[1]))
 
         def do_history():
             try:
                 import history_app
                 history_app.open_history_window(st)
-            except Exception, e:
-                dash.set_automation_status("History error: %s" % str(e))
+            except:
+                dash.set_automation_status("History error: %s" % str(sys.exc_info()[1]))
 
         def do_cars():
             try:
                 import cars_app
                 cars_app.open_cars_window()
-            except Exception, e:
-                dash.set_automation_status("Cars error: %s" % str(e))
+            except:
+                err = sys.exc_info()[1]
+                dash.set_automation_status("Cars error: %s" % str(err))
+
+        def do_pom_test():
+            try:
+                dash.set_automation_status("POM test: stopping loco and writing CV67-94 (Ops Mode)...")
+                try:
+                    st._apply_step(0)
+                except:
+                    pass
+                time.sleep(0.50)
+                table = st._build_pom_test_table()
+                st._write_speed_table_pom(table)
+            except:
+                err = sys.exc_info()[1]
+                dash.set_automation_status("POM test failed: %s" % str(err))
 
         def do_reset_auto():
             st.reset_automation_results()
@@ -3009,6 +3380,7 @@ class Dashboard(object):
         self.btn_db_init.addActionListener(SimpleAL(do_db_init))
         self.btn_history.addActionListener(SimpleAL(do_history))
         self.btn_cars.addActionListener(SimpleAL(do_cars))
+        self.btn_pom_test.addActionListener(SimpleAL(do_pom_test))
         self.btn_calc.addActionListener(SimpleAL(do_calc))
 
     def _start_timers(self):

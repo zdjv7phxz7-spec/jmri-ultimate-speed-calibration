@@ -4,7 +4,7 @@
 CV_GAIN = 0.45
 CV_RATIO_MIN = 0.80
 CV_RATIO_MAX = 1.20
-CV_MAX_STEP_DELTA = 10
+CV_MAX_STEP_DELTA = 40
 
 def clamp_int(v, lo, hi):
     if v < lo:
@@ -58,7 +58,23 @@ def recommend_table_28_damped(base_28, targets_28, meas_28):
             r = base
         else:
             ratio = target / float(meas)
-            damped = 1.0 + CV_GAIN * (ratio - 1.0)
+            # Adaptive gain based on forward percent deviation vs target.
+            # When within 15% we take smaller steps to reduce oscillation.
+            dev_abs = 1.0
+            try:
+                if float(target) != 0.0:
+                    dev_abs = abs((float(meas) - float(target)) / float(target))
+                else:
+                    dev_abs = 1.0
+            except:
+                dev_abs = 1.0
+            scale = dev_abs / 0.15
+            if scale < 0.10:
+                scale = 0.10
+            if scale > 1.0:
+                scale = 1.0
+            eff_gain = CV_GAIN * scale
+            damped = 1.0 + eff_gain * (ratio - 1.0)
             if damped < CV_RATIO_MIN:
                 damped = CV_RATIO_MIN
             if damped > CV_RATIO_MAX:
